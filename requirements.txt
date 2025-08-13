@@ -1,0 +1,7 @@
+python-dotenv
+pandas
+google-api-python-client
+tqdm
+sqlalchemy
+pymysql
+requests
