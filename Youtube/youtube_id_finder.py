@@ -3,7 +3,7 @@ import requests
 import json
 import pandas as pd
 from datetime import datetime, timedelta, date
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 import time
 from dotenv import load_dotenv
@@ -46,6 +46,16 @@ def create_db_engine():
         print(f"Error creating database engine: {e}")
         raise
 
+def check_db_connection(engine):
+    """Check if the database connection works"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("✅ Database connection successful.")
+        return True
+    except SQLAlchemyError as e:
+        print(f"❌ Database connection failed: {e}")
+        return False
 
 def get_channel_activities(channel_id, api_key, max_results=50):
     """
@@ -113,8 +123,9 @@ def process_activities(activities, channel_name):
     
     for activity in activities:
         try:
-            # Extract publication date
-            published_at = activity["snippet"]["publishedAt"].split("T")[0]
+            # Extract publication date as date object
+            published_at_str = activity["snippet"]["publishedAt"].split("T")[0]
+            published_at = datetime.strptime(published_at_str, "%Y-%m-%d").date()
             
             # Skip if not in our date range
             if not (YESTERDAY <= published_at <= TODAY):
@@ -133,9 +144,9 @@ def process_activities(activities, channel_name):
             video = {
                 "channel_id": activity["snippet"]["channelId"],
                 "video_id": video_id,
-                "published_at": published_at,
+                "published_at": published_at_str,  # keep as string for DB storage
                 "channel_name": channel_name,
-                "datetime": datetime.now().strftime("%y-%m-%d %H:%M:%S")
+                "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
             
             videos.append(video)
@@ -187,6 +198,11 @@ def main():
     
     # Create database engine
     engine = create_db_engine()
+    
+    # Check DB connection before proceeding
+    if not check_db_connection(engine):
+        print("Exiting script due to database connection error.")
+        return
     
     # Process all channels
     all_videos = pd.DataFrame()
