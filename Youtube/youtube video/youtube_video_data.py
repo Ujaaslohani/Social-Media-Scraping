@@ -10,6 +10,10 @@ import time
 import logging
 import sys
 from dotenv import load_dotenv
+import io
+
+# Configure stdout to use UTF-8 encoding
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 # Load environment variables
 load_dotenv()
@@ -40,7 +44,9 @@ def setup_logging():
         level=logging.INFO,
         format=log_format,
         handlers=[
-            logging.FileHandler('youtube_data_collector.log'),
+            # Use UTF-8 encoding for the file handler
+            logging.FileHandler('youtube_data_collector.log', encoding='utf-8'),
+            # For console, use errors='replace' to handle problematic characters
             logging.StreamHandler()
         ]
     )
@@ -214,18 +220,18 @@ def process_videos_parallel(video_ids):
 # DATA LOADING AND SAVING
 # ==============================================
 def load_video_ids():
-    """Load video IDs from database for the past 24 hours"""
+    """Load video IDs from YouTube_Daily_Videos table for the past 24 hours"""
     try:
         start_time, end_time = get_date_range()
-        
+
         query = f"""
         SELECT DISTINCT video_id 
-        FROM Daliy_all_vid 
-        WHERE datetime >= '{start_time.strftime('%Y-%m-%d %H:%M:%S')}' 
+        FROM daily_videos
+        WHERE datetime >= '{start_time.strftime('%Y-%m-%d %H:%M:%S')}'
         AND datetime <= '{end_time.strftime('%Y-%m-%d %H:%M:%S')}'
         {'LIMIT 100' if DEBUG_MODE else ''}
         """
-        
+
         print_status(f"Loading video IDs from {start_time} to {end_time}")
         video_ids = pd.read_sql(query, engine)['video_id'].tolist()
         print_status(f"Found {len(video_ids)} videos to process")
@@ -234,42 +240,41 @@ def load_video_ids():
         logger.error(f"Error loading video IDs: {str(e)}")
         return []
 
+
 def save_to_database(df):
-    """Optimized database insertion with transaction management"""
+    """Save processed YouTube video details into YouTube_Data table"""
     if df.empty:
         print_status("No data to save")
         return
     
     try:
+        # Add a default user_id column
+        df['user_id'] = 1  # Use a valid user_id that exists in your users table
+        
         # Convert numeric columns
-        int_cols = ['View_count', 'Favorite_count', 'Comment_count', 'Like_count', 'Dislike_count']
+        int_cols = ['View_count', 'Favorite_count', 'Comment_count', 'Like_count', 'Dislike_count', 'user_id']
         df[int_cols] = df[int_cols].fillna(0).astype(int)
         
-        # Insert in chunks with transaction management
-        chunk_size = 1000
-        total_rows = len(df)
-        saved_rows = 0
+        # Rename columns to match YouTube_Data schema
+        df.rename(columns={
+            'Channel_title': 'channel_name',
+            'Video_id': 'video_id',
+            'Title': 'title',
+            'View_count': 'views',
+            'Like_count': 'likes',
+            'Comment_count': 'comments'
+        }, inplace=True)
         
-        with engine.connect() as connection:
-            with connection.begin() as transaction:
-                try:
-                    for i in tqdm(range(0, total_rows, chunk_size), 
-                                desc="Saving to DB", disable=DEBUG_MODE):
-                        chunk = df.iloc[i:i + chunk_size]
-                        chunk.to_sql('Daliy_vod_inc', connection, if_exists='append', index=False)
-                        saved_rows += len(chunk)
-                        print_status(f"Saved chunk {i//chunk_size + 1}: {len(chunk)} records")
-                    
-                    transaction.commit()
-                    print_status(f"Successfully saved {saved_rows} records to database")
-                except Exception as e:
-                    transaction.rollback()
-                    logger.error(f"Error saving to database: {str(e)}")
-                    logger.error("Transaction rolled back")
-                    raise
+        # Keep all required columns including user_id
+        df = df[['channel_name', 'video_id', 'title', 'views', 'likes', 'comments', 'user_id']]
+        
+        # Insert into YouTube_Data table
+        df.to_sql('YouTube_Data', engine, if_exists='append', index=False)
+        print_status(f"Successfully saved {len(df)} records to YouTube_Data table")
     except Exception as e:
         logger.error(f"Database operation failed: {str(e)}")
         raise
+
 
 # ==============================================
 # MAIN EXECUTION
