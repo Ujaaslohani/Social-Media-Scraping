@@ -14,7 +14,7 @@ CONFIG = {
     'slow_mo': 50,
     'timeout': 120000,  # 2 minutes timeout per channel
     'state_path': 'whatsapp_auth_state.json',
-    'login_wait_time': 90,  # seconds to wait for manual login if needed
+    'login_wait_time': 30,  # seconds to wait for manual login if needed
     'max_retries': 2,  # max retries per channel
 }
 
@@ -56,11 +56,8 @@ except Exception as e:
 
 # Thread-safe results collection
 results_lock = threading.Lock()
-results = {
-    'channel_names': [],
-    'follower_counts': [],
-    'processed_indices': set(),
-}
+# Store results by index to preserve order
+results = {}
 
 def save_state(context, path=CONFIG['state_path']):
     """Save authentication state"""
@@ -163,12 +160,6 @@ def process_channel(page, channel_name, thread_id):
 
 def worker_thread(start_index, count, thread_id):
     """Worker thread to process a range of channels"""
-    thread_results = {
-        'channel_names': [],
-        'follower_counts': [],
-        'processed_indices': set(),
-    }
-    
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -176,51 +167,34 @@ def worker_thread(start_index, count, thread_id):
                 headless=CONFIG['headless'],
                 slow_mo=CONFIG['slow_mo']
             )
-            
             # Try to load existing auth state
             context = load_state(browser) or browser.new_context()
             context.set_default_timeout(CONFIG['timeout'])
-            
             page = context.new_page()
             page.goto("https://web.whatsapp.com/")
-            
             # Check if we need to login
             if page.locator('text="Use WhatsApp on your computer"').count() > 0:
                 print(f"[Thread {thread_id}] Waiting for manual login...")
                 page.wait_for_selector(XPATHS['conversation_list'], timeout=CONFIG['login_wait_time'] * 1000)
                 save_state(context)
                 print(f"[Thread {thread_id}] Logged in and saved auth state")
-            
             # Switch to channels view
             page.click('button[aria-label="Channels"]')
             time.sleep(5)
-            
             end_index = min(start_index + count, len(channel_names))
-            
             for j in range(start_index, end_index):
-                if j in results['processed_indices']:
-                    continue
-                    
                 channel_name = channel_names[j]
                 print(f"[Thread {thread_id}] Processing index {j}: '{channel_name}'")
-                
                 result = process_channel(page, channel_name, thread_id)
-                if result:
-                    actual_name, followers = result
-                    thread_results['channel_names'].append(actual_name)
-                    thread_results['follower_counts'].append(followers)
-                    thread_results['processed_indices'].add(j)
-                
+                with results_lock:
+                    if result:
+                        actual_name, followers = result
+                        results[j] = (actual_name, followers)
+                    else:
+                        # If not processed, at least enter its name and N/A
+                        results[j] = (channel_name, "N/A")
                 time.sleep(1)
-            
-            # Save results
-            with results_lock:
-                results['channel_names'].extend(thread_results['channel_names'])
-                results['follower_counts'].extend(thread_results['follower_counts'])
-                results['processed_indices'].update(thread_results['processed_indices'])
-                
-            print(f"[Thread {thread_id}] Finished. Processed {len(thread_results['channel_names'])} channels")
-            
+            print(f"[Thread {thread_id}] Finished.")
     except Exception as e:
         print(f"[Thread {thread_id}] Thread error: {str(e)}")
         traceback.print_exc()
@@ -231,7 +205,7 @@ def main():
     
     # Calculate thread ranges
     total_entries = len(channel_names)
-    mid_point = total_entries // 2
+    mid_point = total_entries//2
     
     # Create and start threads
     threads = [
@@ -241,27 +215,26 @@ def main():
     
     for t in threads:
         t.start()
-        time.sleep(10)
+        time.sleep(1)
     
     for t in threads:
         t.join()
     
+
     # Prepare final data
     formatted_date = datetime.now().strftime("%b %d %Y")
-    
-    # Align all lists to the original Excel length
+
+    # Reconstruct output lists in input order
     final_channel_names = []
     final_follower_counts = []
-    
-    for i in range(len(channel_names)):
-        if i in results['processed_indices']:
-            idx_in_results = list(results['processed_indices']).index(i)
-            final_channel_names.append(results['channel_names'][idx_in_results])
-            final_follower_counts.append(results['follower_counts'][idx_in_results])
+    for i, channel_name in enumerate(channel_names):
+        if i in results:
+            final_channel_names.append(results[i][0])
+            final_follower_counts.append(results[i][1])
         else:
-            final_channel_names.append("Not processed")
+            final_channel_names.append(channel_name)
             final_follower_counts.append("N/A")
-    
+
     # Create output DataFrame
     output_data = {
         "GroupName": group_names,
@@ -269,18 +242,18 @@ def main():
         "Links/URL": links,
         formatted_date: final_follower_counts,
     }
-    
+
     df_out = pd.DataFrame(output_data)
-    
+
     # Count valid results
-    valid_followers = sum(1 for count in final_follower_counts if count != "N/A" and count != "Not processed")
+    valid_followers = sum(1 for count in final_follower_counts if count != "N/A")
     print(f"\n📊 Total followers fetched: {valid_followers} out of {len(channel_names)} channels")
-    
+
     # Save to Excel
     filename = f'Whatsapp_Followers_Tracking_{formatted_date.replace(" ", "_")}.xlsx'
     df_out.to_excel(filename, index=False)
     print(f"\n✅ Output saved to {filename}")
-    
+
     # Execution time
     end_time = time.time()
     total_seconds = round(end_time - start_time, 2)
