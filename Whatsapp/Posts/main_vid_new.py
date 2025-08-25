@@ -1,327 +1,286 @@
-import os
-import re
-import time
+from playwright.sync_api import sync_playwright
 import pandas as pd
+import time, re, os, traceback, threading
 from datetime import datetime
-import threading
 
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
+CONFIG = {
+    'headless': False,
+    'slow_mo': 50,
+    'timeout': 120000,
+    'state_path': 'whatsapp_auth_state.json',
+    'login_wait_time': 30,
+    'scroll_pause': 1,   # wait after each scroll
+    'scroll_count': 120,  # max scrolls in case date not found
+    'max_retries': 2,
 
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
+    # --- New Date Filters ---
+    'from_date': "10/08/2025",   # stop when reaching this date (discard it)
+    'to_date': "19/08/2025",     # remove posts >= this date before saving
+}
 
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+XPATHS = {
+    'search_box': '//*[@id="app"]/div/div[3]/div/div[2]/div[1]/span/div/span/div/div/div[1]/div/div/div[2]/div/div/div[1]',
+    'clear_search': '//*[@id="app"]/div/div[3]/div/div[2]/div[1]/span/div/span/div/div/div[1]/div/div/div[2]/button/div/span',
+    'channel_header': '//*[@id="main"]/header',
+    'conversation_list': 'div[data-testid="conversation-list"]',
+    'posts_container': '//*[@id="main"]/div[2]/div/div[2]',
+    'post_item': './/div[contains(@class, "message-in") or contains(@class, "message-out")]',
+    'copyable_text': './/div[contains(@class, "copyable-text")]',
+    'reaction_count': './/div[contains(@class,"reactions")]//span',
+}
 
-from webdriver_manager.chrome import ChromeDriverManager
+channels_by_category = {
+    "News": {
+        "Hindi": [
+            'Aaj Tak', 'India TV', 'ABP News', 'News18 India', 'Zee News',
+            'Republic Bharat', 'Times Now Navbharat', 'Good News Today',
+            'TV9 Bharatvarsh', 'NDTV India', 'News - Dainik Bhaskar Hindi - India, Rajasthan, Madhya Pradesh, MP, CG, UP, Bihar, Delhi',
+            'The Lallantop'
+        ],
+        "English": [
+            'India Today', 'The Times of India', 'CNN News18',
+            'NDTV', 'Republic', 'Times Now', 'Firstpost'
+        ]
+    },
+    "Business": [
+        'Business Today', 'Market Today', 'Money Today', 'Tech Today',
+        'Business Today Subscriptions', 'Mint',
+        'Money9', 'ET NOW', 'Republic Business', 'moneycontrol',
+        'Financial Express', 'CNBC-TV18', 'NDTV Profit'
+    ]
+}
 
+results_lock = threading.Lock()
+results = []
 
-def setup_driver():
-    chrome_options = Options()
-    chrome_options.add_argument('--ignore-certificate-errors')
-    chrome_options.add_argument('--ignore-ssl-errors')
-    
-    # Disable images to improve performance
-    prefs = {"profile.managed_default_content_settings.images": 2}
-    chrome_options.add_experimental_option("prefs", prefs)
-    
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    print("[DEBUG] Chrome driver initialized")
-    return driver
+def save_state(context, path=CONFIG['state_path']):
+    storage = context.storage_state()
+    with open(path, "w") as f:
+        f.write(storage)
 
-
-def get_reaction_count(post):
-    try:
-        reaction_elements = post.find_elements(By.XPATH, './/button[contains(@aria-label, "in total")]')
-
-        if not reaction_elements:
-            reaction_elements = post.find_elements(By.XPATH, './/span[contains(@aria-label, "in total")]')
-
-        if not reaction_elements:
-            reaction_elements = post.find_elements(By.XPATH, './/*[contains(@aria-label, "reactions")]')
-
-        for element in reaction_elements:
-            aria_label = element.get_attribute('aria-label')
-            if aria_label:
-                patterns = [
-                    r'([\d,]+)\s+in total',
-                    r'([\d,]+)\s+reactions',
-                    r'([\d,]+)\s+reaction',
-                    r'([\d,.]+)K?\s+in total',
-                ]
-
-                for pattern in patterns:
-                    match = re.search(pattern, aria_label)
-                    if match:
-                        count_str = match.group(1).replace(',', '')
-                        if 'K' in count_str:
-                            return int(float(count_str.replace('K', '')) * 1000)
-                        return int(count_str)
-
-        return 0
-    except Exception as e:
-        print(f"[ERROR] Error getting reaction count: {e}")
-        return 0
-
+def load_state(browser, path=CONFIG['state_path']):
+    if os.path.exists(path):
+        context = browser.new_context(storage_state=path)
+        print("Loaded existing authentication state")
+        return context
+    return None
 
 def extract_links(text):
-    return ', '.join(re.findall(r'(https?://\S+)', str(text)))
+    if not text:
+        return []
+    return re.findall(r'(https?://\S+)', text)
 
+def parse_timestamp(ts_str):
+    """Convert WhatsApp timestamp '17:42, 18/08/2025' → datetime.date"""
+    try:
+        return datetime.strptime(ts_str, "%H:%M, %d/%m/%Y")
+    except:
+        return None
 
-def scrape_channel(driver, channel_name, channel_language, output_folder):
-    print(f"[INFO] Scraping channel: {channel_name}")
+def process_posts(page, channel_name, channel_type):
+    posts_data = []
+    seen_posts = set()
+
+    # Convert config dates to datetime.date
+    from_date = datetime.strptime(CONFIG['from_date'], "%d/%m/%Y").date()
 
     try:
-        channels_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, 'div[title="Channels"]'))
-        )
-        channels_button.click()
-        print("[DEBUG] Clicked on Channels button successfully")
-    except TimeoutException:
-        print("[WARNING] Channels button not clickable. Trying to proceed anyway.")
-    except Exception as e:
-        print(f"[ERROR] Unexpected error clicking Channels button: {e}")
+        posts_container = page.locator(f'xpath={XPATHS["posts_container"]}')
+        stop_scraping = False
 
-    try:
-        # Try both XPaths for search box
-        try:
-            search_box = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located((By.XPATH, '//div[@contenteditable="true"][@data-tab="3"]'))
-            )
-        except TimeoutException:
-            search_box = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="app"]/div/div[3]/div/div[2]/div[1]/span/div/span/div/div/div[1]/div/div/div[2]/div/div/div[1]'))
-            )
-            
-        search_box.clear()
-        search_box.send_keys(channel_name)
-        print(f"[DEBUG] Entered '{channel_name}' in search box")
-        time.sleep(6)  # Wait for search results to load
-        
-        # Try to clear search if needed
-        try:
-            clear_button = WebDriverWait(driver, 2).until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="app"]/div/div[3]/div/div[2]/div[1]/span/div/span/div/div/div[1]/div/div/div[2]/button/div/span'))
-            )
-            clear_button.click()
-            print("[DEBUG] Cleared search box")
-        except:
-            pass
-            
-    except TimeoutException:
-        print(f"[ERROR] Search box not found for channel {channel_name}")
-        return []
-    except Exception as e:
-        print(f"[ERROR] Unexpected error with search box: {e}")
-        return []
+        for i in range(CONFIG['scroll_count']):
+            if stop_scraping:
+                break
 
-    try:
-        channel_elements = WebDriverWait(driver, 15).until(
-            EC.presence_of_all_elements_located((By.XPATH, f'//span[contains(@title, "{channel_name}")]'))
-        )
-        print(f"[DEBUG] Found {len(channel_elements)} potential matches for '{channel_name}'")
-
-        if len(channel_elements) > 0:
-            for element in channel_elements:
-                if channel_name.lower() in element.get_attribute('title').lower():
-                    element.click()
-                    print(f"[DEBUG] Clicked on the match for '{channel_name}'")
-                    break
-            else:
-                channel_elements[0].click()
-                print(f"[DEBUG] Clicked on the first partial match for '{channel_name}'")
-        else:
-            print(f"[WARNING] No matches found for '{channel_name}'")
-            return []
-    except TimeoutException:
-        print(f"[ERROR] Channel {channel_name} not found in search results")
-        return []
-    except Exception as e:
-        print(f"[ERROR] Unexpected error finding or clicking channel: {e}")
-        return []
-
-    time.sleep(5)  # Wait for messages to load
-    print(f"[DEBUG] Waiting completed after clicking '{channel_name}'")
-
-
-
-
-
-
-    # Scroll up to load more messages
-    for i in range(25):
-        driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.PAGE_UP)
-        time.sleep(2)
-        print(f"[DEBUG] Scrolled up {i + 1} times")
-
-    try:
-        posts = WebDriverWait(driver, 10).until(
-            EC.presence_of_all_elements_located((By.XPATH, '//div[contains(@class, "message-in")]'))
-        )
-        print(f"[DEBUG] Found {len(posts)} posts for '{channel_name}'")
-    except TimeoutException:
-        print(f"[WARNING] No posts found for '{channel_name}'")
-        return []
-
-    channel_data = []
-
-    for index, post in enumerate(posts):
-        try:
-            content = ''
             try:
-                content_element = WebDriverWait(post, 5).until(
-                    EC.presence_of_element_located((By.XPATH, './/div[contains(@class, "copyable-text")]'))
-                )
-                content = content_element.text
-            except:
-                try:
-                    content_element = post.find_element(By.XPATH, './/div[contains(@class, "video-caption")]')
-                    content = content_element.text
-                except:
-                    content = "[Media Content]"
+                page.set_default_timeout(5000)
 
-            timestamp = WebDriverWait(post, 5).until(
-                EC.presence_of_element_located((By.XPATH, './/div[contains(@data-pre-plain-text, "[")]'))
-            ).get_attribute('data-pre-plain-text')
+                posts = posts_container.locator("xpath=" + XPATHS['post_item']).all()
+                for post in posts:
+                    try:
+                        content = "[Media Content]"
+                        if post.locator("xpath=" + XPATHS['copyable_text']).count() > 0:
+                            content = post.locator("xpath=" + XPATHS['copyable_text']).nth(0).text_content()
 
-            reaction_count = get_reaction_count(post)
+                        timestamp = None
+                        if post.locator("xpath=" + XPATHS['copyable_text']).count() > 0:
+                            copyable = post.locator("xpath=" + XPATHS['copyable_text']).nth(0)
+                            ts_raw = copyable.get_attribute("data-pre-plain-text")
+                            if ts_raw:
+                                m = re.match(r'\[(.*?)\]', ts_raw.strip())
+                                if m:
+                                    timestamp = m.group(1)
 
-            post_type = "Text"
-            if post.find_elements(By.XPATH, './/video'):
-                post_type = "Video"
-            elif post.find_elements(By.XPATH, './/img[contains(@src, "blob")]'):
-                post_type = "GIF/Image"
+                        reaction_count = "0"
+                        if post.locator("button[aria-label*='Reactions']").count() > 0:
+                            aria_label = post.locator("button[aria-label*='Reactions']").nth(0).get_attribute("aria-label")
+                            if aria_label:
+                                match = re.search(r'(\d+)\s+in total', aria_label)
+                                if match:
+                                    reaction_count = match.group(1)
 
-            links = extract_links(content)
+                        if post.locator("video").count() > 0:
+                            post_type = "Video"
+                        elif post.locator("img[src*='blob']").count() > 0:
+                            post_type = "GIF/Image"
+                        else:
+                            post_type = "Text"
 
-            if timestamp:
-                channel_data.append({
-                    'Channel_Name': channel_name,
-                    'Channel_Language': channel_language,
-                    'Post_Content': content,
-                    'Post_Type': post_type,
-                    'Timestamp': timestamp,
-                    'Post_Reaction': reaction_count,
-                    'Links': links,
-                    'Poll': 'No'
-                })
-                print(f"[INFO] Processed {post_type} post {index + 1} for '{channel_name}' with {reaction_count} reactions")
+                        links = extract_links(content)
 
-        except Exception as e:
-            print(f"[ERROR] Error processing post {index + 1} for '{channel_name}': {e}")
-            continue
+                        post_date = None
+                        if timestamp:
+                            ts_dt = parse_timestamp(timestamp)
+                            if ts_dt:
+                                post_date = ts_dt.date()
+                                # stop if we reach from_date or older
+                                if post_date <= from_date:
+                                    stop_scraping = True
+                                    break
 
-    print(f"[INFO] Finished processing {len(channel_data)} posts for '{channel_name}'")
-    
-    # Save data for this channel to a separate file
-    if channel_data:
-        df = pd.DataFrame(channel_data)
-        file_path = os.path.join(output_folder, f"Whatsapp_Final_Data_{channel_name}_{datetime.now().date()}.xlsx")
-        df.to_excel(file_path, index=False)
-        print(f"[INFO] Data saved to {file_path}")
-    
-    return channel_data
+                        post_key = f"{timestamp}-{content[:30]}"
+                        if post_key not in seen_posts:
+                            seen_posts.add(post_key)
+                            posts_data.append({
+                                "Channel_Name": channel_name,
+                                "Type": channel_type,
+                                "Post_Content": content,
+                                "Post_Type": post_type,
+                                "Timestamp": timestamp,
+                                "Post_Reaction": reaction_count,
+                                "Links": ", ".join(links) if links else "",
+                            })
+                    except:
+                        continue
 
+                page.evaluate("(el) => el.scrollBy(0, -1000)", posts_container.element_handle())
+                time.sleep(CONFIG['scroll_pause'])
+                print(f"[{channel_name}] Scroll {i+1}/{CONFIG['scroll_count']} → {len(posts_data)} posts")
 
-def scrape_channel_category(driver, channels, category_name, output_folder):
-    print(f"[INFO] Starting WhatsApp channels scrape for category: {category_name}")
-    
-    try:
-        driver.get("https://web.whatsapp.com/")
-        print(f"[DEBUG] Navigated to WhatsApp Web: {driver.current_url}")
+            finally:
+                page.set_default_timeout(CONFIG['timeout'])
+
+        print(f"[{channel_name}] ✅ Collected posts: {len(posts_data)}")
+
     except Exception as e:
-        print(f"[ERROR] Failed to navigate to WhatsApp Web: {e}")
-        return []
+        print(f"❌ Error processing posts for {channel_name}: {e}")
+        traceback.print_exc()
 
-    print(f"Please scan the QR code to log in to WhatsApp Web for {category_name}.")
+    return posts_data
+
+def process_channel(page, channel_name, channel_type):
+    retry = 0
+    while retry < CONFIG['max_retries']:
+        try:
+            search_box = page.locator(f'xpath={XPATHS["search_box"]}')
+            search_box.click()
+            time.sleep(1)
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+            search_box.type(channel_name, delay=100)
+            time.sleep(2)
+
+            channel_locator = page.locator(f'span[title="{channel_name}"]')
+            if channel_locator.count() > 0:
+                channel_locator.click()
+            else:
+                print(f"Channel not found: {channel_name}")
+                return []
+            time.sleep(3)
+
+            data = process_posts(page, channel_name, channel_type)
+
+            page.locator(f'xpath={XPATHS["clear_search"]}').click()
+            return data
+        except Exception as e:
+            print(f"Error opening channel {channel_name}: {e}")
+            retry += 1
+            time.sleep(2)
+    return []
+
+def worker_thread(channels, lang_or_category, thread_id):
     try:
-        WebDriverWait(driver, 300).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'div[title="Channels"]'))
-        )
-        print(f"[INFO] Logged in and Channels button found for {category_name}.")
-    except TimeoutException:
-        print(f"[ERROR] Timeout waiting for WhatsApp Web login or Channels button for {category_name}.")
-        return []
-    time.sleep(5)
-    for channel in channels:
-        print(f"\n[INFO] Scraping channel: {channel} in {category_name}")
-        scrape_channel(driver, channel, category_name, output_folder)
-        time.sleep(5)  # small pause between channels
+        with sync_playwright() as p:
+            browser = p.chromium.launch(channel="chrome", headless=CONFIG['headless'], slow_mo=CONFIG['slow_mo'])
+            context = load_state(browser) or browser.new_context()
+            context.set_default_timeout(CONFIG['timeout'])
+            page = context.new_page()
+            page.goto("https://web.whatsapp.com/")
 
+            try:
+                continue_btn = page.locator('xpath=//*[@id="app"]/div[1]/span[2]/div/div/div/div/div/div/div[2]/div/button')
+                if continue_btn.count() > 0:
+                    print(f"[Thread {thread_id}] Found 'Continue' button, clicking it...")
+                    continue_btn.click()
+                    time.sleep(3)
+            except:
+                pass
+
+            if page.locator('text="Use WhatsApp on your computer"').count() > 0:
+                print(f"[Thread {thread_id}] Waiting for manual login...")
+                page.wait_for_selector(XPATHS['conversation_list'], timeout=CONFIG['login_wait_time'] * 1000)
+                save_state(context)
+                print(f"[Thread {thread_id}] Logged in and saved state")
+
+            page.click('button[aria-label="Channels"]')
+            time.sleep(5)
+
+            for ch in channels:
+                print(f"[Thread {thread_id}] Processing channel: {ch}")
+                if lang_or_category == "News":
+                    if ch in channels_by_category["News"]["Hindi"]:
+                        channel_type = "Hindi"
+                    else:
+                        channel_type = "English"
+                else:
+                    channel_type = lang_or_category
+
+                data = process_channel(page, ch, channel_type)
+                with results_lock:
+                    results.extend(data)
+                time.sleep(1)
+    except Exception as e:
+        print(f"[Thread {thread_id}] Error: {e}")
+        traceback.print_exc()
 
 def main():
-    # Define channel lists by language/category
-    channels_by_category = {
-        "News": {  # Combined Hindi and English news channels
-            "Hindi": [
-                'Aaj Tak', 'India TV', 'ABP News', 'News18 India', 'Zee News',
-                'Republic Bharat', 'Times Now Navbharat', 'Good News Today',
-                'TV9 Bharatvarsh', 'NDTV India', 'News - Dainik Bhaskar Hindi - India, Rajasthan, Madhya Pradesh, MP, CG, UP, Bihar, Delhi',
-                'The Lallantop'
-            ],
-            "English": [
-                'India Today', 'The Times of India', 'CNN News18',
-                'NDTV', 'Republic', 'Times Now', 'Firstpost'
-            ]
-        },
-        "Business": [  # Business channels as separate thread
-            'Business Today', 'Market Today', 'Money Today', 'Tech Today',
-            'Business Today Subscriptions', 'Mint',
-            'Money9', 'ET NOW', 'Republic Business', 'moneycontrol',
-            'Financial Express', 'CNBC-TV18', 'NDTV Profit'
-        ]
-    }
-
-    # Create output folder based on today's date
-    output_folder = f"Whatsapp_Final_Data_{datetime.now().date()}"
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-    print(f"[INFO] Output folder created/exists: {output_folder}")
-
-    # Create drivers for each thread
-    driver1 = setup_driver()  # For News (Hindi + English)
-    driver2 = setup_driver()  # For Business
-    
-    # Create and start threads
     threads = []
-    
-    # Thread 1: News channels (Hindi and English)
-    news_thread = threading.Thread(
-        target=lambda: [
-            scrape_channel_category(driver1, channels_by_category["News"]["Hindi"], "Hindi", output_folder),
-            scrape_channel_category(driver1, channels_by_category["News"]["English"], "English", output_folder)
-        ]
-    )
-    threads.append(news_thread)
-    news_thread.start()
-    time.sleep(10)  # Stagger thread starts
-    
-    # Thread 2: Business channels
-    business_thread = threading.Thread(
-        target=scrape_channel_category,
-        args=(driver2, channels_by_category["Business"], "Business", output_folder)
-    )
-    threads.append(business_thread)
-    business_thread.start()
+    news_channels = channels_by_category["News"]["Hindi"] + channels_by_category["News"]["English"]
+    business_channels = channels_by_category["Business"]
 
-    # Wait for all threads to complete
-    for thread in threads:
-        thread.join()
+    t1 = threading.Thread(target=worker_thread, args=(news_channels, "News", 1))
+    t2 = threading.Thread(target=worker_thread, args=(business_channels, "Business", 2))
+    threads.extend([t1, t2])
 
-    # Close all drivers
-    driver1.quit()
-    driver2.quit()
-    print("[INFO] All Chrome drivers closed.")
+    for t in threads:
+        t.start()
+        time.sleep(10)
 
+    for t in threads:
+        t.join()
+
+    df = pd.DataFrame(results)
+
+    # Apply to_date filter before saving
+    if not df.empty:
+        to_date = datetime.strptime(CONFIG['to_date'], "%d/%m/%Y").date()
+
+        def filter_date(ts):
+            try:
+                ts_dt = datetime.strptime(ts, "%H:%M, %d/%m/%Y")
+                return ts_dt.date() < to_date
+            except:
+                return False
+
+        df = df[df['Timestamp'].apply(filter_date)]
+
+    formatted_date = datetime.now().strftime("%b_%d_%Y")
+    filename = f"Whatsapp_Posts_{formatted_date}.xlsx"
+    df.to_excel(filename, index=False)
+    print(f"\n✅ Data saved to {filename}")
 
 if __name__ == "__main__":
     main()
-    
-    
     
     
     
@@ -346,7 +305,7 @@ if __name__ == "__main__":
     #     },
     #     "Business": [  # Business channels as separate thread
     #         'Business Today', 'Market Today', 'Money Today', 'Tech Today',
-    #         'Business Today Subscriptions', 'Mint', 'The Economic Times',
+    #         'Business Today Subscriptions', 'Mint',
     #         'Money9', 'ET NOW', 'Republic Business', 'moneycontrol',
     #         'Financial Express', 'CNBC-TV18', 'NDTV Profit'
     #     ]
