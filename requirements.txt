@@ -1,7 +1,35 @@
-python-dotenv
-pandas
-google-api-python-client
-tqdm
-sqlalchemy
-pymysql
-requests
+# Core Python dependencies
+python-dotenv==1.0.0
+pandas==2.1.0
+requests==2.31.0
+aiofiles==23.2.1
+typing-extensions==4.8.0
+
+# FastAPI and web framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Authentication and security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# Database
+sqlalchemy==2.0.23
+pymysql==1.1.0
+mysql-connector-python==8.2.0
+
+# Rate limiting
+slowapi==0.1.9
+
+# Social media scraping
+selenium==4.15.0
+webdriver-manager==4.15.1
+instaloader==4.9.6
+twikit==1.6.4
+
+# Google APIs (YouTube)
+google-api-python-client==2.108.0
+
+# Progress bars and utilities
+tqdm==4.66.0
